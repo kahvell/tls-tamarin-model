@@ -1,0 +1,89 @@
+theory diffie_hellman_dwie_polowki_w_calosc begin
+
+/*
+ * Protocol:	 Diffie-Hellman with MAC
+ * Modeler: 	 Benedikt Schmidt
+ * Described in: CAV 2013 Submission
+ * Date: 	     January 2013
+ *
+ * Status: 	 	Working, polonized by Urszula Stachowiak 2020
+ */
+
+
+builtins:
+	diffie-hellman
+
+functions:
+	mac/2,                // message_authentication_code(klucz, wiadomosc)
+	g/0,                  // stała, tzw. generator grupy DH
+	kluczMac/0 [private]  // stała tajna - klucz dla funkcji mac
+
+
+/*
+ * Model pierwszego kroku połówki algorytmu DH. A wysyła swój "zaszyfrowany" klucz prywatny do B, podpisując wiadomość sygnaturą MAC.
+ */
+rule Krok1_A_wysyla_zaszyfrowany_klucz_prywatny_do_B:
+	[
+		Fr(watekId:fresh),
+		Fr(kluczPrywatnyA:fresh)
+	]
+	--[ ]->
+	[
+		Out(<g^(kluczPrywatnyA:fresh), mac(kluczMac, <g^(kluczPrywatnyA:fresh), A:pub, B:pub>)>),
+		NadanoZaszyfrowanyKluczPrywatny(watekId:fresh, A:pub, B:pub, kluczPrywatnyA:fresh)
+	]
+
+
+/*
+ * Model drugiego kroku połówki algorytmu DH. B przyjmuje ("zaszyfrowany" klucz prywatny A) i "szyfruje" go swoim kluczem prywatnym, żeby uzyskać klucz sesji.
+ */
+rule Krok2_B_przyjmuje_zaszyfrowany_klucz_prywatny_A:
+	[
+		NadanoZaszyfrowanyKluczPrywatny(watekId, A, B, kluczPrywatnyB:fresh),
+		In(<zaszyfrowanyKluczPrywatnyA, mac(kluczMac, <zaszyfrowanyKluczPrywatnyA, B, A>)>)
+	]
+	--[ ZatwierdzenieKluczaSesji(watekId, zaszyfrowanyKluczPrywatnyA^(kluczPrywatnyB:fresh), A, B) ]->
+	[
+	]
+
+
+/*
+ * Model wycieku klucza MAC do adwersarza. Klucz zostaje wysłany przez niezabezpieczoną sieć, nie ważne skąd się wziął.
+ */
+
+// teraz sprawdzamy poprawność algorytmu a nie jego bezpieczeństwo; ta reguła nie jest potrzebna
+//rule Wyciek_klucza_mac:
+//	[
+//	]
+//	--[ WyciekaKluczMAC() ]->
+//	[
+//		Out(kluczMac)
+//	]
+
+
+/*
+ * Lemat ścisły: nie ma takiej możliwości żeby jednocześnie jakiś kluczSesji został zaakceptowany jako klucz sesji oraz żeby adwerzarz znał kluczSesji.
+ */
+lemma Klucz_sesji_nie_wycieka_nigdy:
+	all-traces
+	"All #t1 #t2 watekId kluczSesji A B. ZatwierdzenieKluczaSesji(watekId, kluczSesji, A, B) @ #t1 & K(kluczSesji) @ #t2 ==> F"
+
+
+/*
+ * Lemat rozluźniony: jeżeli dopuszczamy sytuację w której jednocześnie jakiś kluczSesji został zaakceptowany jako klucz sesji oraz żeby adwersarz znał kluczSesji to musi z tego wynikać, że gdzieś wcześniej kluczMac został ujawniony adwersarzowi.
+ */
+// teraz sprawdzamy poprawność algorytmu a nie jego bezpieczeństwo; ten lemat nie jest potrzebny
+//lemma Klucz_sesji_wycieka_tylko_gdy_klucz_mac_wycieknie_wczesniej:
+//	all-traces
+//	"All #t1 #t2 watekId kluczSesji A B. ZatwierdzenieKluczaSesji(watekId, kluczSesji, A, B) @ #t1 & K(kluczSesji) @ #t2 ==> Ex #t3. WyciekaKluczMAC() @ #t3 & #t3 < #t1"
+
+
+/*
+ * Lemat dodatkowy: poprawne złożenie dwóch połówek algorytmu DH w całość. Jeżeli strona A po otrzymaniu od B danych ustali jakiś klucz sesji to strona B po otrzymaniu danych od A ustali ten sam klucz sesji.
+ */
+lemma Obie_strony_ustalaja_taki_sam_klucz_sesji:
+	all-traces
+	"All #t1 #t2 watekId1 watekId2 kluczSesji1 kluczSesji2 A B. (ZatwierdzenieKluczaSesji(watekId1, kluczSesji1, A, B) @ #t1 & ZatwierdzenieKluczaSesji(watekId2, kluczSesji2, B, A) @ #t2) ==> (kluczSesji1 = kluczSesji2)"
+
+
+end
