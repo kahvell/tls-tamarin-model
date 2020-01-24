@@ -1,0 +1,459 @@
+theory TLS10_Handshake
+begin
+
+builtins:
+	hashing,                // dostarcza h/1 interpretowaną jako idealną funkcję haszową (mieszającą)
+	symmetric-encryption,   // dostarcza senc/2 i sdec/2 modelujące idealny algorytm szyfrujący z kluczem symetrycznym: sedc(senc(message, key), key) = message
+	asymmetric-encryption,  // dostarcza model kryptografii asymetrycznej: adec(aenc(m, pk(sk)), sk) = m, gdzie m to jakaś wiadomość a pk(sk) reprezentuje powiązanie klucza publicznego i prywatnego (wynikiem funkcji pk(sk) dla jakiegoś klucza prywatnego sk jest klucz publiczny odpowiadający sk)
+	signing                 // dostarcza model, w którym kryptografia asymetryczna jest wykorzystywana do podpisywania wiadomości: verify(sign(m,sk),m,pk(sk)) = true
+
+section{* TLS Handshake *}
+
+/*
+ * Protocol:	 TLS Handshake
+ * Modeler: 	 Simon Meier, minor update by Cas Cremers
+ * Date: 		 January 2012
+ * Source:		 Modeled after Paulson`s TLS model in Isabelle/src/HOL/Auth/TLS.thy.
+ *
+ * Status: 		 working (2.5 seconds on an i7 Quad-Core CPU with +RTS -N)
+ * Commented by: Urszula Stachowiak, 2020.01
+ */
+
+text{*
+  Modeled after Paulson`s TLS model in Isabelle/src/HOL/Auth/TLS.thy. Notable
+  differences are:
+
+    1. We use explicit global constants to differentiate between different
+       encryptions instead of implicit sources.
+
+    2. We model session keys directly as hashes of the relevant information.
+       Due to our support for composed keys, we do not need any custom
+       axiomatization as Paulson does.
+
+*}
+
+functions:
+	PRF/1  // PRF = pseudo random function http://www.crypto-it.net/pl/teoria/prf-i-prp.html, interpretacja: funkcja dla każdego argumentu deterministycznie zwraca pewną losową wartość (deterministycznie = dla takiego samego argumentu zawsze taka sama wartość)
+
+// Public key infrastructure
+
+/*
+ * Reguła modeluje umieszczenie pary (klucz_prywatny, klucz_publiczny) dla jakiegoś agenta A w stanie systemu (ich wygenerowanie). Klucz publiczny, jak na klucz publiczny przystało, jest natychmiast rozgłaszany na cały świat.
+ * 
+ * Nazewnictwo:
+ * A - identyfikator agenta/peera
+ * ltkA - long term (private) key peera A
+ * pk(ltkA) - klucz publiczny pasujący do long term (private) key peera A
+ */
+rule Register_pk:
+  [ Fr(~ltkA) ]
+  -->
+  [ !Ltk($A, ~ltkA), !Pk($A, pk(~ltkA)), Out(pk(~ltkA)) ]
+
+
+/*
+ * Modelujemy także możliwość ujawnienia klucza prywatnego gdy tylko zostanie wygenerowany.
+ * 
+ * Później możemy zablokować użycie tej reguły nakładając ograniczenie by w śladzie uznawanym za poprawny nigdy nie wystąpiła obecna tutaj etykieta RevLtk().
+ */
+rule Reveal_ltk:
+  [ !Ltk(A, ltkA) ] --[ RevLtk(A) ]-> [ Out(ltkA) ]
+
+
+/* We formalize the following signature based TLS handshake.
+
+  protocol TLS {
+    1. C -> S: C, nc, sid, pc
+    2. C <- S: ns, sid, ps
+
+    3. C -> S: { '31', pms                     }pk(S) ,
+               sign{ '32', h('32', ns, S, pms) }pk(C) ,
+               { '33', sid, PRF(pms, nc, ns),
+                 nc, pc, C, ns, ps, S
+               }
+               h('clientKey', nc, ns, PRF(pms, nc, ns))
+
+    4. C <- S: { '4', sid, PRF(pms, nc, ns),
+                 nc, pc, C, ns, ps, S
+               }
+               h('serverKey', nc, ns, PRF(pms, nc, ns))
+  }
+*/
+
+// ============================================================================
+
+// Element protokołu:
+// - wysłanie C -> S: C, nc, sid, pc
+// 
+// Odpowiednik ze specyfikacji TLS:
+// 		ClientHello - https://tools.ietf.org/html/rfc5246#section-7.4.1.2, https://tls.ulfheim.net/
+//
+/*
+      struct {
+          ProtocolVersion client_version; // nie dotyczy
+          Random random; // 28 losowych bajtów (initialization vector, aka. client nonce) razem z unixowym timestampem
+          SessionID session_id; // ID sesji do wznowienia (nie dotyczy)
+          CipherSuite cipher_suites<2..2^16-2>; // lista wspieranych przez klienta algorytmów szyfrowania (nie dotyczy)
+          CompressionMethod compression_methods<1..2^8-1>; // lista wspieranych przez klienta algorytmów kompresji danych (nie dotyczy)
+          select (extensions_present) { // lista rozszerzeń ClientHello (nie dotyczy)
+              case false:
+                  struct {};
+              case true:
+                  Extension extensions<0..2^16-1>;
+          };
+      } ClientHello;
+*/
+//
+// Interpretacja termów:
+// - ~nc - nonce klienta
+// - ~sid - ID bieżącej sesji
+// - $C - identyfikator klienta
+// - $pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+rule C_1:
+    [ Fr(~nc)
+    , Fr(~sid)
+    ]
+  --[]->
+    [ Out(
+        <$C, ~nc, ~sid, $pc>
+      )
+    , St_C_1($C, ~nc, ~sid, $pc)
+    ]
+
+// ============================================================================
+
+// Element protokołu:
+// - odebranie C -> S: C, nc, sid, pc
+// - wysłanie C <- S: ns, sid, ps
+// 
+// Odpowiednik ze specyfikacji TLS:
+// 		ClientHello - https://tools.ietf.org/html/rfc5246#section-7.4.1.2, https://tls.ulfheim.net/
+//		ServerHello - https://tools.ietf.org/html/rfc5246#section-7.4.1.3, https://tls.ulfheim.net/
+//		ServerCertificate - https://tools.ietf.org/html/rfc5246#section-7.4.2, https://tls.ulfheim.net/
+//      ServerKeyExchange - https://tools.ietf.org/html/rfc5246#section-7.4.3, https://tls.ulfheim.net/, zakładamy, że używamy algorytmu, który nie potrzebuje dosłania parametrów ECDHE
+//
+/*
+      struct {
+          ProtocolVersion server_version; // nie dotyczy
+          Random random; // 28 losowych bajtów (initialization vector, aka. server nonce) razem z unixowym timestampem
+          SessionID session_id; // ID sesji do wznowienia (nie dotyczy)
+          CipherSuite cipher_suite; // lista wspieranych przez serwer algorytmów szyfrowania (nie dotyczy)
+          CompressionMethod compression_method; // lista wspieranych przez serwer algorytmów kompresji danych (nie dotyczy)
+          select (extensions_present) { // lista rozszerzeń (nie dotyczy)
+              case false:
+                  struct {};
+              case true:
+                  Extension extensions<0..2^16-1>;
+          };
+      } ServerHello;
+*/
+//
+// Interpretacja termów:
+// - ~nc - nonce klienta
+// - sid - ID bieżącej sesji
+// - $C - identyfikator klienta
+// - pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+// - ~ns - nonce serwera
+// - $S - identyfikator serwera
+// - $ps - ? (klucz publiczny (certyfikat) serwera? jako wiadomość ServerCertificate?)
+rule S_1:
+    [ In(
+        <$C, nc, sid, pc>
+      )
+    , Fr(~ns)
+    ]
+  --[]->
+    [ Out(
+        <$S, ~ns, sid, $ps>
+      )
+    , St_S_1($S, $C, sid, nc, pc, ~ns, $ps)
+    ]
+
+// ============================================================================
+
+// Element protokołu:
+// - odbieranie C <- S: ns, sid, ps
+// - wysyłanie: C -> S: { '31', pms }pk(S) ,
+//               sign{ '32', h('32', ns, S, pms) }pk(C),
+//               { '33', sid, PRF(pms, nc, ns), nc, pc, C, ns, ps, S}h('clientKey', nc, ns, PRF(pms, nc, ns))
+// 
+// UWAGA: wyjaśnienie notacji: 
+// 		sign{ '32', h('32', ns, S, ~pms) }ltkC <===> sign(<'32', h('32', ns, S, ~pms)>, ltkC)
+//
+// Odpowiednik ze specyfikacji TLS:
+//		ServerHello - https://tools.ietf.org/html/rfc5246#section-7.4.1.3, https://tls.ulfheim.net/
+//		ServerCertificate - https://tools.ietf.org/html/rfc5246#section-7.4.2, https://tls.ulfheim.net/
+//		ClientKeyExchange - https://tools.ietf.org/html/rfc5246#section-7.4.7, https://tls.ulfheim.net/
+//		Finished aka. ClientHandshakeFinished - https://tools.ietf.org/html/rfc5246#section-7.4.9, https://tls.ulfheim.net/
+//
+// Klient po odebraniu danych od serwera generuje parę (klucz_publiczny_klienta, klucz_prywatny_klienta) na potrzeby wymiany kluczy z serwerem.
+//
+/*
+      struct {
+          select (KeyExchangeAlgorithm) {
+              case rsa:
+                  EncryptedPreMasterSecret; // zakładamy, że modelujemy tylko ten wariant
+              case dhe_dss:
+              case dhe_rsa:
+              case dh_dss:
+              case dh_rsa:
+              case dh_anon:
+                  ClientDiffieHellmanPublic; // nie dotyczy
+          } exchange_keys;
+      } ClientKeyExchange;
+	  
+      struct {
+          ProtocolVersion client_version;
+          opaque random[46];
+      } PreMasterSecret;
+
+      client_version
+         The latest (newest) version supported by the client.  This is
+         used to detect version rollback attacks.
+
+      random
+         46 securely-generated random bytes.
+
+      struct {
+          public-key-encrypted PreMasterSecret pre_master_secret;
+      } EncryptedPreMasterSecret;
+	  
+	  struct {
+          opaque verify_data[verify_data_length];
+      } Finished;
+
+      verify_data
+         PRF(master_secret, finished_label, Hash(handshake_messages))
+            [0..verify_data_length-1];
+*/
+//
+// Interpretacja termów:
+// - ~pms - pre master secret, losowa wartość generowana przez klienta
+// - nc - nonce klienta
+// - ns - nonce serwera
+// - sid - ID bieżącej sesji
+// - $C - identyfikator klienta
+// - pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+// - $S - identyfikator serwera
+// - $ps - ? (klucz publiczny (certyfikat) serwera? jako wiadomość ServerCertificate?)
+// - MS - master secret
+// - pkS -klucz publiczny serwera 
+// - ltkC - long term (private) key klienta
+// - Skey - server write key, jak to opisano w https://tls.ulfheim.net/, sekcja ServerHandshakeFinished
+// - Ckey - client write key, jak to opisano w https://tls.ulfheim.net/, sekcja ClientHandshakeFinished
+//
+// Master secret jest obliczany z pre master seret zgodnie z opisem w https://tools.ietf.org/html/rfc5246#section-8.1. Następnie jest szyfrowany kluczem publicznym serwera i wysyłany do serwera.
+// 
+//
+// 
+rule C_2:
+  let
+      MS   = PRF(~pms, nc, ns)
+      Ckey = h('clientKey', nc, ns, MS) // dokładny proces obliczania klucza client write key opisano w https://tls.ulfheim.net/, sekcja ClientEncryptionKeysCalculation
+      Skey = h('serverKey', nc, ns, MS)
+  in
+    [
+		St_C_1(C, nc, sid, pc),
+		In(<S, ns, sid, ps>),
+		Fr(~pms),
+		!Pk(S, pkS),
+		!Ltk(C, ltkC)
+    ]
+  --[ Running(S, C, <'server', MS, Skey, Ckey>)
+    ]->
+    [ Out(
+        < aenc{ '31', ~pms }pkS // do odszyfrowania prywatnym kluczem serwera, zawartość ClientKeyExchange
+        , sign{ '32', h('32', ns, S, ~pms) }ltkC // sygnatura całej wiadomości, do zweryfikowania publicznym kluczem klienta, nie znaleziono odpowiednika tego elementu komunikatu w https://tls.ulfheim.net/ !!!
+        , senc{ '33', sid, MS, nc, pc, C, ns, ps, S}Ckey // powinien to być hash wszystkich wszystkich przetransferowanych do tej pory w ramach handshake'a komunikatów, zaszyfrowany kluczem client write key, zawartość ClientHandshakeFinished
+        >
+      )
+    , St_C_2(S, C, sid, nc, pc, ns, ps, ~pms)
+    ]
+
+// ============================================================================
+
+// Element protokołu:
+// - odbieranie: C -> S: { '31', pms }pk(S) ,
+//               sign{ '32', h('32', ns, S, pms) }pk(C),
+//               { '33', sid, PRF(pms, nc, ns), nc, pc, C, ns, ps, S}h('clientKey', nc, ns, PRF(pms, nc, ns))
+// - wysyłanie: C <- S: { '4', sid, PRF(pms, nc, ns),
+//                 nc, pc, C, ns, ps, S
+//               }
+//               h('serverKey', nc, ns, PRF(pms, nc, ns))
+//
+// Odpowiednik ze specyfikacji TLS:
+//		Finished aka. ServerHandshakeFinished - https://tools.ietf.org/html/rfc5246#section-7.4.9, https://tls.ulfheim.net/
+//
+/*
+      struct {
+          opaque verify_data[verify_data_length];
+      } Finished;
+
+      verify_data
+         PRF(master_secret, finished_label, Hash(handshake_messages))
+            [0..verify_data_length-1];
+*/
+//
+//
+// Interpretacja termów:
+// - ~pms - pre master secret, losowa wartość generowana przez klienta, otrzymana w wiadomości ClientKeyExchange
+// - nc - nonce klienta
+// - ns - nonce serwera
+// - sid - ID bieżącej sesji
+// - C - identyfikator klienta
+// - pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+// - S - identyfikator serwera
+// - ps - ? (klucz publiczny (certyfikat) serwera? jako wiadomość ServerCertificate?)
+// - MS - master secret
+// - pkC -klucz publiczny klienta
+// - ltkS - long term (private) key serwera
+// - Skey - server write key, jak to opisano w https://tls.ulfheim.net/, sekcja ServerHandshakeFinished
+// - Ckey - client write key, jak to opisano w https://tls.ulfheim.net/, sekcja ClientHandshakeFinished
+//
+// Master secret jest obliczany z pre master seret zgodnie z opisem w https://tools.ietf.org/html/rfc5246#section-8.1.
+rule S_2:
+  let
+      MS   = PRF(pms, nc, ns)
+      Ckey = h('clientKey', nc, ns, MS)
+      Skey = h('serverKey', nc, ns, MS)
+  in
+    [
+		St_S_1(S, C, sid, nc, pc, ns, ps),
+		In(<
+			aenc{ '31', pms }pk(ltkS), // do odszyfrowania prywatnym kluczem serwera, zawartość ClientKeyExchange
+			signature, // sygnatura całej wiadomości, do zweryfikowania publicznym kluczem klienta, nie znaleziono odpowiednika tego elementu komunikatu w https://tls.ulfheim.net/ !!!
+			senc{ '33', sid, MS, nc, pc, C, ns, ps, S}Ckey // powinien to być hash wszystkich wszystkich przetransferowanych do tej pory w ramach handshake'a komunikatów, zaszyfrowany kluczem client write key, zawartość ClientHandshakeFinished
+        >),
+		!Pk(C, pkC),
+		!Ltk(S, ltkS)
+    ]
+    /* Explicit equality check, enforced as part of the property. */
+  --[
+	Eq(verify(signature, <'32', h('32', ns, S, pms)>, pkC), true ), // odnotowanie faktu że sygnatura ClientWriteKey powinna być poprawna, do sprawdzenia później
+	SessionKeys( S, C, Skey, Ckey ), // odnotowanie, że S w rozmowie z C będzie używał Skey jako server write key a C w rozmowie z S - Ckey jako client write key - wiedza po stronie serwera
+	Running(C, S, <'client', MS, Skey, Ckey>), // odnotowanie faktu, że serwer już może wysyłać dane zaszyfrowanym kanałem
+	Commit(S, C, <'server', MS, Skey, Ckey>) // odnotowanie faktu, że serwer ustanowił bezpieczną sesję (wynegocjował klucze sesji)
+    ]->
+    [ Out(
+        senc{ '4', sid, MS, nc, pc, C, ns, ps, S}Skey // powinien to być hash wszystkich wszystkich przetransferowanych do tej pory w ramach handshake'a komunikatów, zaszyfrowany kluczem server write key, zawartość ServerHandshakeFinished
+      )
+    ]
+
+// ============================================================================
+
+// Element protokołu:
+// - odbieranie: C <- S: { '4', sid, PRF(pms, nc, ns),
+//                 nc, pc, C, ns, ps, S
+//               }
+//               h('serverKey', nc, ns, PRF(pms, nc, ns))
+//
+// Odpowiednik ze specyfikacji TLS:
+//		Finished aka. ServerHandshakeFinished - https://tools.ietf.org/html/rfc5246#section-7.4.9, https://tls.ulfheim.net/
+//
+/*
+      struct {
+          opaque verify_data[verify_data_length];
+      } Finished;
+
+      verify_data
+         PRF(master_secret, finished_label, Hash(handshake_messages))
+            [0..verify_data_length-1];
+*/
+//
+//
+// Interpretacja termów:
+// - pms - pre master secret, losowa wartość generowana przez klienta
+// - nc - nonce klienta
+// - ns - nonce serwera
+// - sid - ID bieżącej sesji
+// - C - identyfikator klienta
+// - pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+// - S - identyfikator serwera
+// - ps - ? (klucz publiczny (certyfikat) serwera? jako wiadomość ServerCertificate?)
+// - MS - master secret
+// - Skey - server write key, jak to opisano w https://tls.ulfheim.net/, sekcja ServerHandshakeFinished
+// - Ckey - client write key, jak to opisano w https://tls.ulfheim.net/, sekcja ClientHandshakeFinished
+//
+// Master secret jest obliczany z pre master seret zgodnie z opisem w https://tools.ietf.org/html/rfc5246#section-8.1.
+
+rule C_3:
+  let
+      MS   = PRF(pms, nc, ns)
+      Ckey = h('clientKey', nc, ns, MS)
+      Skey = h('serverKey', nc, ns, MS)
+  in
+    [ St_C_2(S, C, sid, nc, pc, ns, ps, pms)
+    , In( senc{ '4', sid, MS, nc, pc, C, ns, ps, S}Skey )
+    ]
+  --[
+	Commit(C, S, <'client', MS, Skey, Ckey>), // odnotowanie faktu, że klient ustanowił bezpieczną sesję (wynegocjował klucze sesji)
+	SessionKeys( S, C, Skey, Ckey ) // odnotowanie, że S w rozmowie z C będzie używał Skey jako server write key a C w rozmowie z S - Ckey jako client write key - wiedza po stronie klienta
+    ]->
+    []
+
+// ============================================================================
+
+/* TODO: Also model session-key reveals and adapt security properties. */
+
+/* MEH... */
+
+// ============================================================================
+
+// powiązanie etykiety Eq(a, b) z faktyczną równością termów a i b - potrzebne do weryfikacji podpisu wiadomości
+// czyli: bierz pod uwagę tylko te ślady w których Eq() faktycznie oznacza równość
+restriction Eq_check_succeed: "All x y #i. Eq(x,y) @ i ==> x = y"
+
+// ============================================================================
+
+/* Session key secrecy from the perspective of both the server and the client
+ * for both the key of the server and the key of the client. Note that this
+ * lemma thus captures four security properties at once. */
+lemma session_key_secrecy:
+     /* It cannot be that */
+   "not(
+         Ex S C keyS keyC #k.
+           /* somebody claims to have setup session keys, */
+           SessionKeys(S, C, keyS, keyC) @ k
+           /* but the adversary knows one of them */
+         & ( (Ex #i. K(keyS) @ i)
+           | (Ex #i. K(keyC) @ i)
+           )
+           /* without having performed a long-term key reveal. */
+         & not (Ex #r. RevLtk(S) @ r)
+         & not (Ex #r. RevLtk(C) @ r)
+       )"
+
+// Injective agreement from the perspective of both the initiator and the responder.
+lemma injective_agree:
+  " /* Whenever somebody commits to running a session, then*/
+    All actor peer params #i.
+        Commit(actor, peer, params) @ i
+      ==>
+        /* there is somebody running a session with the same parameters */
+          (Ex #j. Running(actor, peer, params) @ j & j < i
+            /* and there is no other commit on the same parameters */
+            & not(Ex actor2 peer2 #i2.
+                    Commit(actor2, peer2, params) @ i2 & not(#i = #i2)
+                 )
+          )
+        /* or the adversary perform a long-term key reveal on actor or peer */
+        | (Ex #r. RevLtk(actor) @ r)
+        | (Ex #r. RevLtk(peer)  @ r)
+  "
+
+/* Consistency check: ensure that session-keys can be setup between honest
+ * agents. */
+lemma session_key_setup_possible:
+  exists-trace
+  " /* There is a trace satisfying all equality checks */
+     (All x y #i. Eq(x,y) @ i ==> x = y)
+  &  /* Session keys have been setup */
+     (Ex S C keyS keyC #k.  SessionKeys(S, C, keyS, keyC) @ k
+      /* without having performed a long-term key reveal. */
+      & not (Ex #r. RevLtk(S) @ r)
+      & not (Ex #r. RevLtk(C) @ r)
+      )
+   "
+
+end
+
