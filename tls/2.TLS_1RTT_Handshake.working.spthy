@@ -1,0 +1,293 @@
+theory TLS13_Handshake
+begin
+
+builtins:
+	hashing,                // dostarcza h/1 interpretowaną jako idealną funkcję haszową (mieszającą)
+	symmetric-encryption,   // dostarcza senc/2 i sdec/2 modelujące idealny algorytm szyfrujący z kluczem symetrycznym: sedc(senc(message, key), key) = message
+	asymmetric-encryption,  // dostarcza model kryptografii asymetrycznej: adec(aenc(m, pk(sk)), sk) = m, gdzie m to jakaś wiadomość a pk(sk) reprezentuje powiązanie klucza publicznego i prywatnego (wynikiem funkcji pk(sk) dla jakiegoś klucza prywatnego sk jest klucz publiczny odpowiadający sk)
+	signing                 // dostarcza model, w którym kryptografia asymetryczna jest wykorzystywana do podpisywania wiadomości: verify(sign(m,sk),m,pk(sk)) = true
+
+section{* TLS 1-RTT Handshake *}
+
+/*
+ * Protocol:	 TLS 1.3 Handshake
+ * Modeler: 	 Urszula Stachowiak
+ * Date: 		 January 2020
+ * Source:		 Modeled after Paulson`s TLS model in Isabelle/src/HOL/Auth/TLS.thy and TLS 1.3 handshake example by Michael Driscoll at https://tls13.ulfheim.net/
+ *
+ * Status: 		 wip
+ */
+
+text{*
+  Modeled after Paulson`s TLS model in Isabelle/src/HOL/Auth/TLS.thy. Notable
+  differences are:
+
+    1. We use explicit global constants to differentiate between different
+       encryptions instead of implicit sources.
+
+    2. We model session keys directly as hashes of the relevant information.
+       Due to our support for composed keys, we do not need any custom
+       axiomatization as Paulson does.
+	   
+	The above is the original note from Simon Meier, author of TLS 1.2
+	handshake model which this work is based upon. It holds also for 1-RTT
+	model.
+
+*}
+
+functions:
+	PRF/1,             // PRF = pseudo random function http://www.crypto-it.net/pl/teoria/prf-i-prp.html, interpretacja: funkcja dla każdego argumentu deterministycznie zwraca pewną losową wartość (deterministycznie = dla takiego samego argumentu zawsze taka sama wartość)
+	curve25519mult/2, // interpretacja: wynik mnożenia dwóch wartości za pomocą algorytmu wykorzystującego krzywą eliptyczną 25519
+	HDKFExtract/2,     // interpretacja: dla podanego salta (wstępnej wartości losowej) i jakiegoś klucza dostarcza nowy klucz, w którym entropia pochodząca z klucza źródłowego jest rozłożona równomiernie, za: https://tls13.ulfheim.net/, ServerHandshakeKeysCalc
+	HDKFExpandLabel/3  // interpretacja: dla podanego klucza, kontekstu i etykiety funkcja generuje zupełnie nowy klucz, za: https://tls13.ulfheim.net/, ServerHandshakeKeysCalc
+
+// ZAKOMENTUJ PONIŻSZE DEFINICJE RÓWNOŚCI JEŻELI >>>NIE<<< UŻYWASZ MODELU MNOŻENIA NA KRZYWYCH ELIPTYCZNYCH
+//equations:
+//	curve25519mult(A, pk(B)) = curve25519mult(pk(A), B),  // własności mnożenia punktów na krzywej eliptycznej wydedukowana z https://tls13.ulfheim.net/
+//	curve25519mult(X, Y) = curve25519mult(Y, X)
+
+
+
+// Public key infrastructure
+
+/*
+ * Reguła modeluje umieszczenie pary (klucz_prywatny, klucz_publiczny) dla jakiegoś agenta A w stanie systemu (ich wygenerowanie). Klucz publiczny, jak na klucz publiczny przystało, jest natychmiast rozgłaszany na cały świat.
+ * 
+ * Nazewnictwo:
+ * A - identyfikator agenta/peera
+ * ltkA - long term (private) key peera A
+ * pk(ltkA) - klucz publiczny pasujący do long term (private) key peera A
+ */
+rule Register_pk:
+  [ Fr(~ltkA) ]
+  -->
+  [ !Ltk($A, ~ltkA), !Pk($A, pk(~ltkA)), Out(pk(~ltkA)) ]
+
+
+/*
+ * Modelujemy także możliwość ujawnienia klucza prywatnego gdy tylko zostanie wygenerowany.
+ * 
+ * Później możemy zablokować użycie tej reguły nakładając ograniczenie by w śladzie uznawanym za poprawny nigdy nie wystąpiła obecna tutaj etykieta RevLtk().
+ */
+rule Reveal_ltk:
+  [ !Ltk(A, ltkA) ] --[ RevLtk(A) ]-> [ Out(ltkA) ]
+
+// ============================================================================
+
+// ClientHello
+//
+// Interpretacja termów:
+// - ~nc - nonce klienta
+// - ~sid - ID bieżącej sesji
+// - $C - identyfikator klienta
+// - $pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+rule C_1:
+	[
+		Fr(~nc),
+		Fr(~sid)
+	]
+	--[]->
+	[
+		Out(<$C, ~nc, ~sid, $pc>),
+		St_C_1($C, ~nc, ~sid, $pc)
+    ]
+
+// ============================================================================
+
+// ServerHello, (encrypted) Wrapper(ServerCertificate, ServerHandshakeFinished), ServerApplicationKeyCalc
+//
+// Interpretacja termów:
+// - nc - nonce klienta
+// - sid - ID bieżącej sesji
+// - $C - identyfikator klienta
+// - pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+// - ~ns - nonce serwera
+// - $S - identyfikator serwera
+// - $ps - ? (klucz publiczny (certyfikat) serwera? jako wiadomość ServerCertificate?)
+// - MS - master secret
+// - pkC -klucz publiczny klienta
+// - ltkS - long term (private) key serwera
+rule S_1:
+	let
+		// -----obliczenia w kroku ServerHandshakeKeysCalc-----
+		ss = curve25519mult(pkC, ltkS) // shared secret
+		hh = h(<<C, nc, sid, pc>, <$S, ~ns, sid, $ps>>) //handshake hash liczony na podstawie CLientHello i ServerHello
+		es = HDKFExtract('0', '0') //early secret
+		ds = HDKFExpandLabel(es, 'derived', h('null')) //derived secret
+		hs = HDKFExtract(ds, ss) // handshake secret
+		CHSsecret = HDKFExpandLabel(hs, 'c_hs_traffic', hh) //client handshake traffic secret
+		SHSsecret = HDKFExpandLabel(hs, 's_hs_traffic', hh) //server handshake traffic secret
+		CHSkey = HDKFExpandLabel(SHSsecret, 'key', 'null') //client handshake key
+		SHSkey = HDKFExpandLabel(CHSsecret, 'key', 'null') //server handshake key
+		
+		// -----obliczenia w kroku ServerApplicationKeysCalc-----
+		ads = HDKFExpandLabel(hs, 'derived', h('null')) //application derived secret
+		ahh = h(<<$C, nc, sid, pc>, <$S, ~ns, sid, $ps>, <$S, sid, $ps>>) //handshake hash liczony na podstawie ClientHello, ServerHello i Wrapper(ServerCertificate, ServerHandshakeFinished)
+		MS = HDKFExtract(ads, '0') // master secret
+		Csecret = HDKFExpandLabel(MS, 'c_ap_traffic', hh) //client application traffic secret
+		Ssecret = HDKFExpandLabel(MS, 's_ap_traffic', hh) //server application traffic secret
+		Ckey = HDKFExpandLabel(Csecret, 'key', 'null') // client application key
+		Skey = HDKFExpandLabel(Ssecret, 'key', 'null') // server application key
+	in
+	[
+		In(<C, nc, sid, pc>), // odczytanie wiadomości ClientHello
+		Fr(~ns), // wylosowanie server nonce
+		!Pk(C, pkC), // pobranie publicznego klucza klienta
+		!Ltk($S, ltkS) // pobranie prywatnego klucza serwera
+	]
+	--[
+		SessionKeys( $S, C, Skey, Ckey ), // odnotowanie, że S w rozmowie z C będzie używał Skey jako server write key a C w rozmowie z S - Ckey jako client write key - wiedza po stronie serwera
+		Running($S, C, <'server', MS, Skey, Ckey>), // Serwer S wie, że sam jest na chodzie
+		Running(C, $S, <'client', MS, Skey, Ckey>), // Serwer S widzi, że klient C jest na chodzie 
+		Commit($S, C, <'server', MS, Skey, Ckey>) // odnotowanie faktu, że serwer od tego momentu może commitować (wysyłać zaszyfrowane wiadomości) do bezpiecznego połączenia
+	]->
+	[
+		Out(<$S, ~ns, sid, $ps>), // ServerHello
+		Out(senc{$S, sid, $ps}Skey), // Wrapper(ServerCertificate, ServerHandshakeFinished)
+		St_S_1($S, C, sid, nc, pc, ~ns, $ps, Ckey, Skey) // zapamiętujemy stan serwera w rozmowie z klientem
+	]
+
+// ============================================================================
+
+// ClientHandshakeKeysCalc, ClientApplicationKeysCalc, (encrypted) Wrapper(ClientHandshakeFinished)
+//
+// Interpretacja termów:
+// - nc - nonce klienta
+// - ns - nonce serwera
+// - sid - ID bieżącej sesji
+// - C - identyfikator klienta
+// - S - identyfikator serwera
+// - pc - ? (klucz publiczny (certyfikat) klienta? jako extension?)
+// - $ps - ? (klucz publiczny (certyfikat) serwera?)
+// - MS - master secret
+// - pkC -klucz publiczny klienta
+// - ltkS - long term (private) key serwera
+// 
+//
+// 
+rule C_2:
+	let
+		// -----obliczenia w kroku ServerHandshakeKeysCalc-----
+		// ZAKOMENTUJ PONIŻSZĄ LINIĘ I ODKOMENTUJ KOLEJNĄ JEŻELI >>>NIE<<< UŻYWASZ MODELU MNOŻENIA NA KRZYWYCH ELIPTYCZNYCH
+//		ss = curve25519mult(pkS, ltkC) // shared secret
+		ss = curve25519mult(pkC, ltkS) // shared secret
+		hh = h(<<C, nc, sid, pc>, <S, ns, sid, ps>>) //handshake hash liczony na podstawie CLientHello i ServerHello
+		es = HDKFExtract('0', '0') //early secret
+		ds = HDKFExpandLabel(es, 'derived', h('null')) //derived secret
+		hs = HDKFExtract(ds, ss) // handshake secret
+		CHSsecret = HDKFExpandLabel(hs, 'c_hs_traffic', hh) //client handshake traffic secret
+		SHSsecret = HDKFExpandLabel(hs, 's_hs_traffic', hh) //server handshake traffic secret
+		CHSkey = HDKFExpandLabel(SHSsecret, 'key', 'null') //client handshake key
+		SHSkey = HDKFExpandLabel(CHSsecret, 'key', 'null') //server handshake key
+		
+		// -----obliczenia w kroku ServerApplicationKeysCalc-----
+		ads = HDKFExpandLabel(hs, 'derived', h('null')) //application derived secret
+		ahh = h(<<C, nc, sid, pc>, <S, ns, sid, ps>, <S, sid, ps>>) //handshake hash liczony na podstawie ClientHello, ServerHello i Wrapper(ServerCertificate, ServerHandshakeFinished)
+		MS = HDKFExtract(ads, '0') // master secret
+		Csecret = HDKFExpandLabel(MS, 'c_ap_traffic', hh) //client application traffic secret
+		Ssecret = HDKFExpandLabel(MS, 's_ap_traffic', hh) //server application traffic secret
+		Ckey = HDKFExpandLabel(Csecret, 'key', 'null') // client application key
+		Skey = HDKFExpandLabel(Ssecret, 'key', 'null') // server application key
+	in
+    [
+		St_C_1(C, nc, sid, pc), // stan klienta zapamiętany po wysłaniu wiadomości ClientHello
+		In(<S, ns, sid, ps>), // ServerHello
+		In(senc{S, sid, ps}Skey), // Wrapper(ServerCertificate, ServerHandshakeFinished)
+		!Pk(S, pkS),
+		!Ltk(C, ltkC),
+		// ODKOMENTUJ DWIE PONIŻSZE LINIE JEŻELI >>>NIE<<< UŻYWASZ MODELU MNOŻENIA NA KRZYWYCH ELIPTYCZNYCH
+		!Pk(C, pkC),
+		!Ltk(S, ltkS)
+    ]
+	--[
+		Running(S, C, <'server', MS, Skey, Ckey>), // klient C widzi, że serwer jest na chodzie
+		Commit(C, S, <'client', MS, Skey, Ckey>), // od tego momentu klient może commitować (wysyłać komunikaty) do bezpiecznego połączenia z serwerem
+		SessionKeys( S, C, Skey, Ckey ) // odnotowanie, że S w rozmowie z C będzie używał Skey jako server write key a C w rozmowie z S - Ckey jako client write key - wiedza po stronie klienta
+	]->
+    [
+//		Out(<
+//			aenc{ '31', ~pms }pkS,
+//			sign{ '32', h('32', ns, S, ~pms) }ltkC,
+//			senc{ '33', sid, MS, nc, pc, C, ns, ps, S}Ckey
+//		>),
+//		St_C_2(S, C, sid, nc, pc, ns, ps, ~pms)
+    ]
+
+// ============================================================================
+
+/* TODO: Also model session-key reveals and adapt security properties. */
+
+/* MEH... */
+
+// ============================================================================
+
+// powiązanie etykiety Eq(a, b) z faktyczną równością termów a i b - potrzebne do weryfikacji podpisu wiadomości
+// czyli: bierz pod uwagę tylko te ślady w których Eq() faktycznie oznacza równość
+//restriction Eq_check_succeed: "All x y #i. Eq(x,y) @ i ==> x = y"
+
+// ============================================================================
+
+/*
+ * Session key secrecy from the perspective of both the server and the client
+ * for both the key of the server and the key of the client. Note that this
+ * lemma thus captures four security properties at once.
+ */
+lemma session_key_secrecy [sources]:
+	all-traces
+	/* It cannot be that */
+	"not(
+		Ex S C keyS keyC #k.
+			/* somebody claims to have setup session keys, */
+			SessionKeys(S, C, keyS, keyC) @ #k
+			/* but the adversary knows one of them */
+			& ( (Ex #i. K(keyS) @ #i) | (Ex #i. K(keyC) @ #i))
+			/* without having performed a long-term key reveal. */
+			& not (Ex #r. RevLtk(S) @ #r)
+			& not (Ex #r. RevLtk(C) @ #r)
+		)
+	"
+
+/* 
+ * Injective agreement from the perspective of both the initiator and the responder.
+ */
+lemma injective_agree [sources]:
+	all-traces
+	"
+	/* Whenever somebody commits to running a session, then */
+	All actor peer params #i.
+		Commit(actor, peer, params) @ #i
+		==>
+		(Ex #j.
+			/* there is >>>ALREADY<<< somebody running a session with the same parameters */
+			Running(actor, peer, params) @ #j & (#j < #i | /* istota 1-RTT!!! */#j = #i)
+			/* and there is no other commit on the same parameters */
+            & not(Ex actor2 peer2 #i2.
+				Commit(actor2, peer2, params) @ #i2 & not(#i = #i2)
+			)
+		)
+		/* or the adversary perform a long-term key reveal on actor or peer */
+		| (Ex #r. RevLtk(actor) @ #r)
+		| (Ex #r. RevLtk(peer)  @ #r)
+	"
+
+
+/*
+ * Consistency check: ensure that session-keys can be setup between honest agents.
+ */
+lemma session_key_setup_possible:
+	exists-trace
+	"
+		/* There is a trace satisfying all equality checks */
+		(All x y #i. Eq(x,y) @ #i ==> x = y)
+		&
+		/* Session keys have been setup */
+		(Ex S C keyS keyC #k. 
+			SessionKeys(S, C, keyS, keyC) @ #k
+			/* without having performed a long-term key reveal. */
+			& not (Ex #r. RevLtk(S) @ #r)
+			& not (Ex #r. RevLtk(C) @ #r)
+		)
+   "
+
+end
+
