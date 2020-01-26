@@ -1,0 +1,306 @@
+theory DTLS_Handshake_with_ClientHelloVerify
+begin
+
+builtins:
+	hashing,
+	symmetric-encryption,
+	asymmetric-encryption,
+	signing
+
+section{* DTLS Handshake *}
+
+functions:
+	PRF/1, // pseudo-random function
+	HMAC/1, // hash message authentication code
+	ServerSecret/1 [private] // random, constant sercret generator for each server
+
+// ============================================================================
+
+// Public key infrastructure
+rule Register_pk:
+  [ Fr(~ltkA) ]
+  -->
+  [ !Ltk($A, ~ltkA), !Pk($A, pk(~ltkA)), Out(pk(~ltkA)) ]
+
+rule Reveal_ltk:
+  [ !Ltk(A, ltkA) ] --[ RevLtk(A)    ]-> [ Out(ltkA) ]
+
+// ============================================================================
+
+/*
+ * Klient wysyła ClientHello bez ciasteczka.
+ * Serwer nie musi obsługiwać mechanizmu ochrony przed DoS, więc może
+ * odpowiedzieć od razu komunikatem ServerHello, a może też zażądać dodatkowej
+ * weryfikacji w postaci ClientHelloVerify.
+ */
+rule C_0:
+	[
+		Fr(~nc),
+		Fr(~sid)
+	]
+	--[]->
+	[
+		Out(<
+			'client_hello', $C, $S, ~nc, ~sid, $pc,
+			HMAC(<'client_hello', $C, $S, ~nc, ~sid, $pc>)
+		>), // ClientHello bez ciasteczka
+		St_C_0($C, $S, ~nc, ~sid, $pc), // Klient w tym stanie może odebrać ClientHelloVerify
+		St_C_1($C, ~nc, ~sid, $pc) // Klient w tym stanie może odebrać ServerHello bezpośrednio
+    ]
+
+// ============================================================================
+
+/*
+ * Serwer MOŻE odpowiedzieć na ClientHello bez ciasteczka wysyłając
+ * ClientHelloVerify ze świeżo wygenerowanym ciasteczkiem.
+ */
+rule S_0:
+	let
+		cookie = h(<C, S, sid , ServerSecret(S)>)
+	in
+	[
+		In(<
+			'client_hello', C, S, nc, sid, pc,
+			HMAC(<'client_hello', C, S, nc, sid, pc>)
+		>) // ClientHello
+    ]
+	--[ AssignsCookie(S, C) ]->
+	[
+		Out(<
+			'client_hello_verify', S, C, sid, cookie, 
+			HMAC(<'client_hello_verify', S, C, sid, cookie>)
+		>) // ClientHelloVerify
+		/*
+		 * nie dodajemy żadnego stanu = nie alokujemy zasobów
+		 */
+    ]
+
+// ============================================================================
+
+/*
+ * Klient wysyła ClientHello jeszcze raz, tym razem z ciasteczkiem. Warunkiem
+ * zadziałania tej reguły jest to, żeby klient wcześniej wysłał ClientHello bez
+ * ciasteczka (żeby istniał stan, z którego może odtworzyć parametry połączenia).
+ */
+rule C_1:
+    [
+		In(<
+			'client_hello_verify', S, C, sid, cookie,
+			HMAC(<'client_hello_verify', S, C, sid, cookie>)
+		>), // ClientHelloVerify
+		St_C_0(C, S, nc, sid, pc)
+    ]
+	--[ ResendsCookie(C, S) ]->
+	[
+		Out(<
+			'client_hello_with_cookie', C, S, nc, sid, pc, cookie,
+			HMAC(<'client_hello_with_cookie', C, S, nc, sid, pc, cookie>)
+		>), // ClientHello z ciasteczkiem
+		St_C_1(C, nc, sid, pc)
+    ]
+
+// ============================================================================
+
+/*
+ * Serwer MOŻE odpowiedzieć na ClientHello bez cisteczka komunikatem ServerHello.
+ * Mechanizm ciasteczek nie jest obowiązkowy do implementacji, a o jego
+ * zastosowaniu decyduje serwer.
+ */
+rule S_1_no_cookie:
+	[
+		In(<
+			'client_hello', C, S, nc, sid, pc,
+			HMAC(<'client_hello', C, S, nc, sid, pc>)
+		>), // ClientHello
+		Fr(~ns)
+	]
+	--[]->
+	[
+		Out(
+			<S, ~ns, sid, $ps> // ServerHello
+		),
+		St_S_1(S, C, sid, nc, pc, ~ns, $ps)
+	]
+
+// ============================================================================
+
+/*
+ * Z drugiej strony serwer może również odpowiedzieć na ClientHello z cookie.
+ */
+rule S_1:
+	let
+		cookie = h(<C, S, sid, ServerSecret(S)>)
+	in
+    [
+		In(<
+			'client_hello_with_cookie', C, S, nc, sid, pc, cookie,
+			HMAC(<'client_hello_with_cookie', C, S, nc, sid, pc, cookie>)
+		>), // ClientHello z ciasteczkiem (weryfikacja ciasteczka na podstawie pattern matchingu)
+		Fr(~ns)
+    ]
+	--[ VerifiesCookie(S, C) ]->
+	[
+		Out(
+			<S, ~ns, sid, $ps> // ServerHello
+		),
+		St_S_1(S, C, sid, nc, pc, ~ns, $ps)
+    ]
+
+// ============================================================================
+
+/*
+ * Drugi krok klienta według standardowej procedury.
+ */
+rule C_2:
+  let
+      MS   = PRF(~pms, nc, ns)
+      Ckey = h('clientKey', nc, ns, MS)
+      Skey = h('serverKey', nc, ns, MS)
+  in
+    [ St_C_1(C, nc, sid, pc)
+    , In(
+        <S, ns, sid, ps, HMAC(<S, ns, sid, ps>)>
+      )
+    , Fr(~pms)
+    , !Pk(S, pkS)
+    , !Ltk(C, ltkC)
+    ]
+  --[ Running(S, C, <'server', MS, Skey, Ckey>)
+    ]->
+    [ Out(
+        < aenc{ '31', ~pms }pkS
+        , sign{ '32', h('32', ns, S, ~pms) }ltkC
+        , senc{ '33', sid, MS, nc, pc, C, ns, ps, S}Ckey
+        >
+      )
+    , St_C_2(S, C, sid, nc, pc, ns, ps, ~pms)
+    ]
+
+// ============================================================================
+
+/*
+ * Drugi krok serwera według standardowej procedury.
+ */
+rule S_2:
+  let
+      MS   = PRF(pms, nc, ns)
+      Ckey = h('clientKey', nc, ns, MS)
+      Skey = h('serverKey', nc, ns, MS)
+  in
+    [ St_S_1(S, C, sid, nc, pc, ns, ps)
+    , In(
+        < aenc{ '31', pms }pk(ltkS)
+        , signature
+        , senc{ '33', sid, MS, nc, pc, C, ns, ps, S}Ckey
+        >
+      )
+    , !Pk(C, pkC)
+    , !Ltk(S, ltkS)
+    ]
+    /* Explicit equality check, enforced as part of the property. */
+  --[ Eq(verify(signature, <'32', h('32', ns, S, pms)>, pkC), true )
+    , SessionKeys( S, C, Skey, Ckey )
+    , Running(C, S, <'client', MS, Skey, Ckey>)
+    , Commit(S, C, <'server', MS, Skey, Ckey>)
+    ]->
+    [ Out(
+        senc{ '4', sid, MS, nc, pc, C, ns, ps, S}Skey
+      )
+    ]
+
+// ============================================================================
+
+/*
+ * Końcowa weryfikacja po stronie klienta według standardowej procedury.
+ */
+rule C_3:
+  let
+      MS   = PRF(pms, nc, ns)
+      Ckey = h('clientKey', nc, ns, MS)
+      Skey = h('serverKey', nc, ns, MS)
+  in
+    [ St_C_2(S, C, sid, nc, pc, ns, ps, pms)
+    , In( senc{ '4', sid, MS, nc, pc, C, ns, ps, S}Skey )
+    ]
+  --[ Commit(C, S, <'client', MS, Skey, Ckey>)
+    , SessionKeys( S, C, Skey, Ckey )
+    ]->
+    []
+
+// ============================================================================
+
+axiom Eq_check_succeed: "All x y #i. Eq(x,y) @ i ==> x = y"
+
+// ============================================================================
+
+/* Session key secrecy from the perspective of both the server and the client
+ * for both the key of the server and the key of the client. Note that this
+ * lemma thus captures four security properties at once. */
+lemma DTLS_session_key_secrecy:
+     /* It cannot be that */
+   "not(
+         Ex S C keyS keyC #k.
+           /* somebody claims to have setup session keys, */
+           SessionKeys(S, C, keyS, keyC) @ k
+           /* but the adversary knows one of them */
+         & ( (Ex #i. K(keyS) @ i)
+           | (Ex #i. K(keyC) @ i)
+           )
+           /* without having performed a long-term key reveal. */
+         & not (Ex #r. RevLtk(S) @ r)
+         & not (Ex #r. RevLtk(C) @ r)
+       )"
+
+// Injective agreement from the perspective of both the initiator and the responder.
+lemma injective_agree:
+  " /* Whenever somebody commits to running a session, then*/
+    All actor peer params #i.
+        Commit(actor, peer, params) @ i
+      ==>
+        /* there is somebody running a session with the same parameters */
+          (Ex #j. Running(actor, peer, params) @ j & j < i
+            /* and there is no other commit on the same parameters */
+            & not(Ex actor2 peer2 #i2.
+                    Commit(actor2, peer2, params) @ i2 & not(#i = #i2)
+                 )
+          )
+        /* or the adversary perform a long-term key reveal on actor or peer */
+        | (Ex #r. RevLtk(actor) @ r)
+        | (Ex #r. RevLtk(peer)  @ r)
+  "
+
+/* Consistency check: ensure that session-keys can be setup between honest
+ * agents. */
+lemma DTLS_session_key_setup_possible:
+  exists-trace
+  " /* There is a trace satisfying all equality checks */
+     (All x y #i. Eq(x,y) @ i ==> x = y)
+  &  /* Session keys have been setup */
+     (Ex S C keyS keyC #k.  SessionKeys(S, C, keyS, keyC) @ k
+      /* without having performed a long-term key reveal. */
+      & not (Ex #r. RevLtk(S) @ r)
+      & not (Ex #r. RevLtk(C) @ r)
+      )
+   "
+
+/*
+ * Dodatkowe ograniczenie: ślad jest poprawny jeżeli serwer deklarujący
+ * rozpoczęcie właściwego handshake'a wcześniej otrzymał od klienta poprawne
+ * ciasteczko.
+ */
+restriction server_required_to_use_cookies:
+	"All S C MS Skey Ckey #t2. Running(S, C, <'server', MS, Skey, Ckey>) @ #t2 ==> Ex #t1. VerifiesCookie(S, C) @ #t1"
+
+lemma server_accepts_connections_only_from_clients_with_valid_cookie:
+	all-traces
+	"All S C Cparams Sparams #t2 #t3. 
+		(Commit(S, C, Sparams) @ #t2
+		& Commit(C, S, Cparams) @ #t3)
+		==>
+		Ex #t1.
+		(VerifiesCookie(S, C) @ #t1
+		& (#t1 < #t2)
+		& (#t1 < #t3))
+	"
+
+end
